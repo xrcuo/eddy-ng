@@ -241,6 +241,21 @@ class ProbeEddyParams:
     # in the range of 0.0 to 1.0.
     tap_time_position: float = 0.3
 
+    # Enable automatic retry when a tap detection value exceeds the threshold.
+    tap_retry_enable: bool = False
+    # The threshold above which a tap detection value triggers a retry.
+    # The compared metric is controlled by tap_retry_metric.
+    tap_retry_threshold: float = 0.0
+    # Maximum number of retries when the threshold is exceeded.
+    tap_retry_max_count: int = 3
+    # The tap metric to compare against the threshold: "probe_z", "overshoot", or "stddev".
+    tap_retry_metric: str = "probe_z"
+    # Action to take when retries are exhausted and the threshold is still exceeded.
+    # "error" raises an error, "use_last" uses the last result, "abort" aborts the tap.
+    tap_retry_stop_action: str = "error"
+    # Optional G-code command to run when retries are exhausted. Executed before the stop action.
+    tap_retry_next_gcode: str = ""
+
     # When probing multiple points (not rapid scan), how long to sample for at each probe point,
     # after a scan_sample_time_delay delay. The total dwell time at each probe point is
     # scan_sample_time + scan_sample_time_delay.
@@ -336,6 +351,21 @@ class ProbeEddyParams:
         )
         self.tap_time_position = config.getfloat("tap_time_position", self.tap_time_position, minval=0.0, maxval=1.0)
 
+        self.tap_retry_enable = config.getboolean("tap_retry_enable", self.tap_retry_enable)
+        self.tap_retry_threshold = config.getfloat("tap_retry_threshold", self.tap_retry_threshold)
+        self.tap_retry_max_count = config.getint("tap_retry_max_count", self.tap_retry_max_count, minval=0)
+        self.tap_retry_metric = config.getchoice(
+            "tap_retry_metric",
+            ["probe_z", "overshoot", "stddev"],
+            self.tap_retry_metric,
+        )
+        self.tap_retry_stop_action = config.getchoice(
+            "tap_retry_stop_action",
+            ["error", "use_last", "abort"],
+            self.tap_retry_stop_action,
+        )
+        self.tap_retry_next_gcode = config.get("tap_retry_next_gcode", self.tap_retry_next_gcode)
+
         if self.tap_trigger_safe_start_height == -1.0:  # sentinel
             self.tap_trigger_safe_start_height = self.home_trigger_height / 2.0
 
@@ -372,6 +402,12 @@ class ProbeEddyParams:
             raise printer.config_error(
                 "ProbeEddy: butter mode with custom filter parameters requires scipy, which is not available; please install scipy, use the defaults, or use wma mode"
             )
+
+        if self.tap_retry_enable:
+            if self.tap_retry_metric == "stddev" and self.tap_samples == 1:
+                raise printer.config_error(
+                    "ProbeEddy: tap_retry_metric='stddev' requires tap_samples > 1"
+                )
 
 
 @dataclass
@@ -1630,7 +1666,12 @@ class ProbeEddy:
     #
     # Tap probe
     #
-    cmd_TAP_help = "Calculate a z-offset by touching the build plate."
+    cmd_TAP_help = (
+        "Calculate a z-offset by touching the build plate. "
+        "Optional retry arguments: RETRY_ENABLE, RETRY_THRESHOLD, RETRY_MAX, "
+        "RETRY_METRIC (probe_z/overshoot/stddev), RETRY_STOP_ACTION (error/use_last/abort), "
+        "RETRY_NEXT_GCODE."
+    )
 
     def cmd_TAP(self, gcmd: GCodeCommand):
         drive_current = self._sensor.get_drive_current()
@@ -1787,93 +1828,36 @@ class ProbeEddy:
 
         return s_t, filtered
 
-    def cmd_TAP_next(self, gcmd: Optional[GCodeCommand] = None):
-        self._log_debug("\nEDDYng Tap begin")
+    def _execute_tap_sampling(
+        self,
+        tap_drive_current: int,
+        tap_start_z: float,
+        target_z: float,
+        tap_speed: float,
+        lift_speed: float,
+        tapcfg: ProbeEddy.TapConfig,
+        samples: int,
+        max_samples: int,
+        samples_stddev: float,
+        use_median: bool,
+        write_tap_plot: bool,
+        write_every_tap_plot: bool,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], int, Optional[ProbeEddy.TapResult], Optional[ProbeEddy.TapResult]]:
+        """Execute the tap sampling loop and return the computed tap result.
 
-        if gcmd is None:
-            gcmd = self._dummy_gcode_cmd
-
-        orig_drive_current: int = self._sensor.get_drive_current()
-        tap_drive_current: int = gcmd.get_int(
-            name="DRIVE_CURRENT",
-            default=self._tap_drive_current,
-            minval=1,
-            maxval=31,
-        )
-        tap_speed: float = gcmd.get_float("SPEED", self.params.tap_speed, above=0.0)
-        lift_speed: float = gcmd.get_float("RETRACT_SPEED", self.params.lift_speed, above=0.0)
-        tap_start_z: float = gcmd.get_float("START_Z", self.params.tap_start_z, above=2.0)
-        target_z: float = gcmd.get_float("TARGET_Z", self.params.tap_target_z)
-        tap_threshold: float = gcmd.get_float("THRESHOLD", None)  # None so we have a sentinel value
-        tap_threshold = gcmd.get_float("TT", tap_threshold)  # alias for THRESHOLD
-        tap_adjust_z = gcmd.get_float("ADJUST_Z", self._tap_adjust_z)
-        do_retract = gcmd.get_int("RETRACT", 1) == 1
-        samples = gcmd.get_int("SAMPLES", self.params.tap_samples, minval=1)
-        max_samples = gcmd.get_int("MAX_SAMPLES", self.params.tap_max_samples, minval=samples)
-        samples_stddev = gcmd.get_float("SAMPLES_STDDEV", self.params.tap_samples_stddev, above=0.0)
-        use_median: bool = gcmd.get_int("USE_MEDIAN", 1 if self.params.tap_use_median else 0) == 1
-        home_z: bool = gcmd.get_int("HOME_Z", 1) == 1
-        write_plot_arg: int = gcmd.get_int("PLOT", None)
-
-        mode = gcmd.get("MODE", self.params.tap_mode).lower()
-        if mode not in ("wma", "butter"):
-            raise self._printer.command_error(f"Invalid mode: {mode}")
-
-        # if the mode is different than the params, then require
-        # specifying threshold
-        if tap_threshold is None:
-            if mode != self.params.tap_mode:
-                raise self._printer.command_error(
-                    f"THRESHOLD required when mode ({mode}) is different than configured default ({self.params.tap_mode})"
-                )
-            tap_threshold = self.params.tap_threshold
-
-        if not self._z_homed():
-            raise self._printer.command_error("Z axis must be homed before tapping")
-
-        write_tap_plot = self.params.write_tap_plot
-        write_every_tap_plot = self.params.write_every_tap_plot and write_tap_plot
-        if write_plot_arg is not None:
-            write_tap_plot = write_plot_arg > 0
-            write_every_tap_plot = write_plot_arg > 1
-
-        tapcfg = ProbeEddy.TapConfig(mode=mode, threshold=tap_threshold)
-        # fmt: off
-        if mode == "butter":
-            if self.params.is_default_butter_config() and self._sensor._data_rate == 250:
-                sos = [
-                    [ 0.046131802093312926, 0.09226360418662585, 0.046131802093312926, 1.0, -1.3297767184682712, 0.5693902189294331, ],
-                    [ 1.0, -2.0, 1.0, 1.0, -1.845000600983779, 0.8637525213328747, ],
-                ]
-            elif self.params.is_default_butter_config() and self._sensor._data_rate == 500:
-                sos = [
-                    [ 0.013359200027856505, 0.02671840005571301, 0.013359200027856505, 1.0, -1.686278256753083, 0.753714473246724, ],
-                    [ 1.0, -2.0, 1.0, 1.0, -1.9250515947328444, 0.9299234737648037, ],
-                ]
-            elif scipy:
-                sos = scipy.signal.butter(
-                    self.params.tap_butter_order,
-                    [ self.params.tap_butter_lowcut, self.params.tap_butter_highcut, ],
-                    btype="bandpass",
-                    fs=self._sensor._data_rate,
-                    output="sos",
-                ).tolist()
-            else:
-                raise self._printer.command_error("Scipy is not available, cannot use custom filter, or data rate is not 250 or 500")
-            tapcfg.sos = sos
-        # fmt: on
-
-        results = []
-        tap_z = None
-        tap_stddev = None
-        tap_overshoot = None
+        Returns:
+            (tap_z, tap_stddev, tap_overshoot, sample_err_count, sample_last_err, last_tap)
+        """
+        results: List[ProbeEddy.TapResult] = []
+        tap_z: Optional[float] = None
+        tap_stddev: Optional[float] = None
+        tap_overshoot: Optional[float] = None
         sample_err_count = 0
-        tap = None
+        sample_last_err: Optional[ProbeEddy.TapResult] = None
+        tap: Optional[ProbeEddy.TapResult] = None
 
         try:
             self._sensor.set_drive_current(tap_drive_current)
-
-            sample_last_err = None
 
             for sample_i in range(max_samples):
                 if self.params.debug:
@@ -1928,6 +1912,204 @@ class ProbeEddy:
                 except Exception as e:
                     self._log_error(f"Failed to write tap plot: {e}")
 
+        return tap_z, tap_stddev, tap_overshoot, sample_err_count, sample_last_err, tap
+
+    def _check_tap_retry_condition(
+        self,
+        metric: str,
+        threshold: float,
+        tap_z: Optional[float],
+        tap_stddev: Optional[float],
+        tap_overshoot: Optional[float],
+    ) -> Tuple[bool, float, str]:
+        """Check whether the tap result exceeds the configured retry threshold.
+
+        Returns:
+            (triggered, value, metric_name)
+        """
+        value: float = 0.0
+        if metric == "probe_z":
+            value = tap_z if tap_z is not None else 0.0
+        elif metric == "overshoot":
+            value = tap_overshoot if tap_overshoot is not None else 0.0
+        elif metric == "stddev":
+            value = tap_stddev if tap_stddev is not None else 0.0
+
+        triggered = value > threshold
+        return triggered, value, metric
+
+    def _run_tap_retry_next_gcode(self, next_gcode: str):
+        """Run the configured next G-code command after retries are exhausted."""
+        if not next_gcode:
+            return
+        self._log_msg(f"Tap retry: executing next gcode: {next_gcode}")
+        try:
+            self._gcode.run_script_from_command(next_gcode)
+        except Exception as e:
+            self._log_error(f"Tap retry: failed to execute next gcode '{next_gcode}': {e}")
+
+    def cmd_TAP_next(self, gcmd: Optional[GCodeCommand] = None):
+        self._log_debug("\nEDDYng Tap begin")
+
+        if gcmd is None:
+            gcmd = self._dummy_gcode_cmd
+
+        orig_drive_current: int = self._sensor.get_drive_current()
+        tap_drive_current: int = gcmd.get_int(
+            name="DRIVE_CURRENT",
+            default=self._tap_drive_current,
+            minval=1,
+            maxval=31,
+        )
+        tap_speed: float = gcmd.get_float("SPEED", self.params.tap_speed, above=0.0)
+        lift_speed: float = gcmd.get_float("RETRACT_SPEED", self.params.lift_speed, above=0.0)
+        tap_start_z: float = gcmd.get_float("START_Z", self.params.tap_start_z, above=2.0)
+        target_z: float = gcmd.get_float("TARGET_Z", self.params.tap_target_z)
+        tap_threshold: float = gcmd.get_float("THRESHOLD", None)  # None so we have a sentinel value
+        tap_threshold = gcmd.get_float("TT", tap_threshold)  # alias for THRESHOLD
+        tap_adjust_z = gcmd.get_float("ADJUST_Z", self._tap_adjust_z)
+        do_retract = gcmd.get_int("RETRACT", 1) == 1
+        samples = gcmd.get_int("SAMPLES", self.params.tap_samples, minval=1)
+        max_samples = gcmd.get_int("MAX_SAMPLES", self.params.tap_max_samples, minval=samples)
+        samples_stddev = gcmd.get_float("SAMPLES_STDDEV", self.params.tap_samples_stddev, above=0.0)
+        use_median: bool = gcmd.get_int("USE_MEDIAN", 1 if self.params.tap_use_median else 0) == 1
+        home_z: bool = gcmd.get_int("HOME_Z", 1) == 1
+        write_plot_arg: int = gcmd.get_int("PLOT", None)
+
+        retry_enable: bool = gcmd.get_int("RETRY_ENABLE", 1 if self.params.tap_retry_enable else 0) == 1
+        retry_threshold: float = gcmd.get_float("RETRY_THRESHOLD", self.params.tap_retry_threshold)
+        retry_max_count: int = gcmd.get_int("RETRY_MAX", self.params.tap_retry_max_count, minval=0)
+        retry_metric: str = gcmd.get("RETRY_METRIC", self.params.tap_retry_metric).lower()
+        if retry_metric not in ("probe_z", "overshoot", "stddev"):
+            raise self._printer.command_error(f"Invalid RETRY_METRIC: {retry_metric}")
+        if retry_enable and retry_metric == "stddev" and samples == 1:
+            raise self._printer.command_error("RETRY_METRIC=stddev requires SAMPLES > 1")
+        retry_stop_action: str = gcmd.get("RETRY_STOP_ACTION", self.params.tap_retry_stop_action).lower()
+        if retry_stop_action not in ("error", "use_last", "abort"):
+            raise self._printer.command_error(f"Invalid RETRY_STOP_ACTION: {retry_stop_action}")
+        retry_next_gcode: str = gcmd.get("RETRY_NEXT_GCODE", self.params.tap_retry_next_gcode)
+
+        mode = gcmd.get("MODE", self.params.tap_mode).lower()
+        if mode not in ("wma", "butter"):
+            raise self._printer.command_error(f"Invalid mode: {mode}")
+
+        # if the mode is different than the params, then require
+        # specifying threshold
+        if tap_threshold is None:
+            if mode != self.params.tap_mode:
+                raise self._printer.command_error(
+                    f"THRESHOLD required when mode ({mode}) is different than configured default ({self.params.tap_mode})"
+                )
+            tap_threshold = self.params.tap_threshold
+
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before tapping")
+
+        write_tap_plot = self.params.write_tap_plot
+        write_every_tap_plot = self.params.write_every_tap_plot and write_tap_plot
+        if write_plot_arg is not None:
+            write_tap_plot = write_plot_arg > 0
+            write_every_tap_plot = write_plot_arg > 1
+
+        tapcfg = ProbeEddy.TapConfig(mode=mode, threshold=tap_threshold)
+        # fmt: off
+        if mode == "butter":
+            if self.params.is_default_butter_config() and self._sensor._data_rate == 250:
+                sos = [
+                    [ 0.046131802093312926, 0.09226360418662585, 0.046131802093312926, 1.0, -1.3297767184682712, 0.5693902189294331, ],
+                    [ 1.0, -2.0, 1.0, 1.0, -1.845000600983779, 0.8637525213328747, ],
+                ]
+            elif self.params.is_default_butter_config() and self._sensor._data_rate == 500:
+                sos = [
+                    [ 0.013359200027856505, 0.02671840005571301, 0.013359200027856505, 1.0, -1.686278256753083, 0.753714473246724, ],
+                    [ 1.0, -2.0, 1.0, 1.0, -1.9250515947328444, 0.9299234737648037, ],
+                ]
+            elif scipy:
+                sos = scipy.signal.butter(
+                    self.params.tap_butter_order,
+                    [ self.params.tap_butter_lowcut, self.params.tap_butter_highcut, ],
+                    btype="bandpass",
+                    fs=self._sensor._data_rate,
+                    output="sos",
+                ).tolist()
+            else:
+                raise self._printer.command_error("Scipy is not available, cannot use custom filter, or data rate is not 250 or 500")
+            tapcfg.sos = sos
+        # fmt: on
+
+        (
+            tap_z,
+            tap_stddev,
+            tap_overshoot,
+            sample_err_count,
+            sample_last_err,
+            tap,
+        ) = self._execute_tap_sampling(
+            tap_drive_current=tap_drive_current,
+            tap_start_z=tap_start_z,
+            target_z=target_z,
+            tap_speed=tap_speed,
+            lift_speed=lift_speed,
+            tapcfg=tapcfg,
+            samples=samples,
+            max_samples=max_samples,
+            samples_stddev=samples_stddev,
+            use_median=use_median,
+            write_tap_plot=write_tap_plot,
+            write_every_tap_plot=write_every_tap_plot,
+        )
+
+        retry_count = 0
+        threshold_exceeded = False
+        threshold_value = 0.0
+        threshold_metric = retry_metric
+        if retry_enable and tap_z is not None:
+            threshold_exceeded, threshold_value, threshold_metric = self._check_tap_retry_condition(
+                retry_metric, retry_threshold, tap_z, tap_stddev, tap_overshoot
+            )
+            if threshold_exceeded:
+                self._log_msg(
+                    f"Tap retry: {threshold_metric}={threshold_value:.3f} exceeds threshold {retry_threshold:.3f}"
+                )
+                while retry_count < retry_max_count:
+                    retry_count += 1
+                    self._log_msg(f"Tap retry: attempt {retry_count}/{retry_max_count}")
+                    (
+                        tap_z,
+                        tap_stddev,
+                        tap_overshoot,
+                        sample_err_count,
+                        sample_last_err,
+                        tap,
+                    ) = self._execute_tap_sampling(
+                        tap_drive_current=tap_drive_current,
+                        tap_start_z=tap_start_z,
+                        target_z=target_z,
+                        tap_speed=tap_speed,
+                        lift_speed=lift_speed,
+                        tapcfg=tapcfg,
+                        samples=samples,
+                        max_samples=max_samples,
+                        samples_stddev=samples_stddev,
+                        use_median=use_median,
+                        write_tap_plot=write_tap_plot,
+                        write_every_tap_plot=write_every_tap_plot,
+                    )
+                    if tap_z is None:
+                        self._log_error("Tap retry: tap failed during retry attempt")
+                        break
+                    threshold_exceeded, threshold_value, threshold_metric = self._check_tap_retry_condition(
+                        retry_metric, retry_threshold, tap_z, tap_stddev, tap_overshoot
+                    )
+                    if not threshold_exceeded:
+                        self._log_msg(
+                            f"Tap retry: {threshold_metric}={threshold_value:.3f} within threshold {retry_threshold:.3f}"
+                        )
+                        break
+                    self._log_msg(
+                        f"Tap retry: {threshold_metric}={threshold_value:.3f} still exceeds threshold {retry_threshold:.3f}"
+                    )
+
         th = self._toolhead
 
         # If we didn't compute a tap_z report the error
@@ -1938,10 +2120,32 @@ class ProbeEddy:
             if tap_stddev is not None:
                 err_msg += f" stddev {tap_stddev:.3f} > {samples_stddev:.3f}."
                 err_msg += " Consider adjusting tap_samples, tap_max_samples, or tap_samples_stddev."
-            if sample_err_count > 0:
+            if sample_err_count > 0 and sample_last_err is not None:
                 err_msg += f" {sample_err_count} errors, last: {sample_last_err.error} at toolhead z={sample_last_err.toolhead_z:.3f}"
             self._log_error(err_msg)
             raise self._printer.command_error("Tap failed")
+
+        # Handle retry stop action if the threshold is still exceeded after all retries
+        if retry_enable and threshold_exceeded:
+            self._log_error(
+                f"Tap retry: threshold still exceeded after {retry_count} retries ({threshold_metric}={threshold_value:.3f} > {retry_threshold:.3f})"
+            )
+            self._run_tap_retry_next_gcode(retry_next_gcode)
+            if retry_stop_action == "error":
+                raise self._printer.command_error(
+                    f"Tap retry exceeded: {threshold_metric}={threshold_value:.3f} > {retry_threshold:.3f}"
+                )
+            elif retry_stop_action == "abort":
+                self._log_msg("Tap retry: aborting tap sequence")
+                th.manual_move([None, None, tap_start_z], lift_speed)
+                th.wait_moves()
+                th.flush_step_generation()
+                self._log_debug("EDDYng Tap abort\n")
+                return
+            elif retry_stop_action == "use_last":
+                self._log_msg(
+                    f"Tap retry: using last result despite threshold ({threshold_metric}={threshold_value:.3f})"
+                )
 
         # Adjust the computed tap_z by the user's tap_adjust_z, typically to raise
         # it to account for flex in the system (otherwise the Z would be too low)
