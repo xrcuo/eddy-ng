@@ -1441,17 +1441,25 @@ class ProbeEddy:
             "sample_retract_dist": 0.0,
         }
 
-    def start_probe_session(self, gcmd):
-        session = ProbeEddyScanningProbe(self, gcmd)
-        session._start_session()
-        return session
-        # method = gcmd.get('METHOD', 'automatic').lower()
-        # if method in ('scan', 'rapid_scan'):
-        #    session = ProbeEddyScanningProbe(self, gcmd)
-        #    session._start_session()
-        #    return session
-        #
-        # return self._probe_session.start_probe_session(gcmd)
+    def start_probe_session(self, gcmd) -> object:
+        method = gcmd.get('METHOD', 'automatic').lower()
+
+        # For scan/rapid_scan probes: always use the scanning probe (requires Z homed)
+        if method in ('scan', 'rapid_scan'):
+            session = ProbeEddyScanningProbe(self, gcmd)
+            session._start_session()
+            return session
+
+        # If Z is already homed, use the scanning probe (existing behavior)
+        if self._z_homed():
+            session = ProbeEddyScanningProbe(self, gcmd)
+            session._start_session()
+            return session
+
+        # Homing flow (G28 Z via probe:z_virtual_endstop): Z is not yet homed.
+        # Use the descend session which does NOT check Z homed and uses
+        # phoming.probing_move() with the endstop wrapper as the MCU probe.
+        return ProbeEddyDescendSession(self)
 
     def get_status(self, eventtime):
         if self._cmd_helper is not None:
@@ -2179,6 +2187,72 @@ class ProbeEddy:
         self._sampler.finish()
         self._sampler = None
 
+
+
+# Probe interface for homing/descend operations (G28 Z).
+# This session uses the endstop wrapper as the mcu_probe for phoming.probing_move()
+# and does NOT require Z to be homed first.
+@final
+class ProbeEddyDescendSession:
+    def __init__(self, eddy: ProbeEddy):
+        self._eddy = eddy
+        self._printer = eddy._printer
+        self._result = None
+
+    def run_probe(self, gcmd):
+        toolhead = self._printer.lookup_object('toolhead')
+        pos = toolhead.get_position()
+
+        # Target position well below the trigger height (the trigger fires
+        # at home_trigger_height, so this is just a safety margin — the
+        # move will stop at the trigger point, not at this target)
+        pos[2] = -5.0
+
+        speed = gcmd.get_float('PROBE_SPEED', self._eddy.params.probe_speed, above=0.0)
+
+        phoming = self._printer.lookup_object('homing')
+        # probing_move will internally create a HomingMove which fires:
+        #   homing:homing_move_begin → _handle_homing_move_begin starts sampler
+        #   → home_start() configures sensor trigger → drip_move → trigger
+        #   → home_wait() → homing:homing_move_end → sampler finished
+        trig_pos = phoming.probing_move(self._eddy._endstop_wrapper, pos, speed)
+
+        # Get toolhead position after probing_move (this is haltpos)
+        cur_pos = toolhead.get_position()
+
+        # Read sensor height at trigger time from the just-completed sampler
+        last_sampler = self._eddy._last_sampler
+        trigger_time = self._eddy._endstop_wrapper.last_trigger_time
+
+        bed_z = trig_pos[2]  # fallback: use trigger position directly
+        if last_sampler and trigger_time > 0.0 and last_sampler.heights:
+            try:
+                # Read height in a small window around the trigger time
+                height = last_sampler.find_height_at_time(
+                    trigger_time - 0.050, trigger_time + 0.050
+                )
+                # bed_z = toolhead_z_at_halt - sensor_height_above_bed
+                bed_z = cur_pos[2] - height
+            except self._printer.command_error:
+                pass
+
+        # Create ProbeResult for the homing flow
+        if HAS_PROBE_RESULT_TYPE:
+            self._result = manual_probe.ProbeResult(
+                cur_pos[0], cur_pos[1], bed_z,
+                trig_pos[0], trig_pos[1], trig_pos[2],
+            )
+        else:
+            self._result = [cur_pos[0], cur_pos[1], bed_z]
+
+    def pull_probed_results(self):
+        if self._result is None:
+            raise self._printer.command_error("ProbeEddyDescendSession: no result")
+        return [self._result]
+
+    def end_probe_session(self):
+        self._eddy._endstop_wrapper.tap_config = None
+        self._result = None
 
 
 # Probe interface that does only scanning, no up/down movement.
