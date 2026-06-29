@@ -309,6 +309,13 @@ class ProbeEddyParams:
         except:
             raise configerror(f"Can't parse '{s}' as list of floats")
 
+    @staticmethod
+    def _get_optional_config_float(config: ConfigWrapper, name: str) -> Optional[float]:
+        """Read an optional float config value, returning None if not present."""
+        if config.get(name, None) is None:
+            return None
+        return config.getfloat(name)
+
     def is_default_butter_config(self):
         return self.tap_butter_lowcut == 5.0 and self.tap_butter_highcut == 25.0 and self.tap_butter_order == 2
 
@@ -379,15 +386,25 @@ class ProbeEddyParams:
         )
         self.tap_retry_next_gcode = config.get("tap_retry_next_gcode", self.tap_retry_next_gcode)
 
-        self.saved_tap_z = config.getfloat("saved_tap_z", self.saved_tap_z)
-        self.saved_tap_offset = config.getfloat("saved_tap_offset", self.saved_tap_offset)
-        self.saved_tap_offset_version = config.getint("saved_tap_offset_version", self.saved_tap_offset_version, minval=1)
-        self.saved_tap_offset_timestamp = config.getfloat("saved_tap_offset_timestamp", self.saved_tap_offset_timestamp)
-        self.saved_tap_offset_name = config.get("saved_tap_offset_name", self.saved_tap_offset_name)
+        self.saved_tap_z = self._get_optional_config_float(config, "saved_tap_z")
+        self.saved_tap_offset = self._get_optional_config_float(config, "saved_tap_offset")
+        self.saved_tap_offset_version = config.getint(
+            "saved_tap_offset_version", self.saved_tap_offset_version, minval=1
+        )
+        self.saved_tap_offset_timestamp = self._get_optional_config_float(
+            config, "saved_tap_offset_timestamp"
+        )
+        self.saved_tap_offset_name = config.get(
+            "saved_tap_offset_name", self.saved_tap_offset_name
+        )
 
-        self.saved_tap_z_backup = config.getfloat("saved_tap_z_backup", self.saved_tap_z_backup)
-        self.saved_tap_offset_backup = config.getfloat("saved_tap_offset_backup", self.saved_tap_offset_backup)
-        self.saved_tap_offset_backup_timestamp = config.getfloat("saved_tap_offset_backup_timestamp", self.saved_tap_offset_backup_timestamp)
+        self.saved_tap_z_backup = self._get_optional_config_float(config, "saved_tap_z_backup")
+        self.saved_tap_offset_backup = self._get_optional_config_float(
+            config, "saved_tap_offset_backup"
+        )
+        self.saved_tap_offset_backup_timestamp = self._get_optional_config_float(
+            config, "saved_tap_offset_backup_timestamp"
+        )
 
         if self.tap_trigger_safe_start_height == -1.0:  # sentinel
             self.tap_trigger_safe_start_height = self.home_trigger_height / 2.0
