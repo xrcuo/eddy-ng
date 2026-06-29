@@ -256,6 +256,19 @@ class ProbeEddyParams:
     # Optional G-code command to run when retries are exhausted. Executed before the stop action.
     tap_retry_next_gcode: str = ""
 
+    # Saved Z offset values from automatic calibration. These allow loading a previously
+    # calibrated Z offset without requiring a physical PROBE_EDDY_NG_TAP operation.
+    saved_tap_z: Optional[float] = None
+    saved_tap_offset: Optional[float] = None
+    saved_tap_offset_version: int = 1
+    saved_tap_offset_timestamp: Optional[float] = None
+    saved_tap_offset_name: str = "default"
+
+    # Backup values kept before overwriting saved_tap_z / saved_tap_offset.
+    saved_tap_z_backup: Optional[float] = None
+    saved_tap_offset_backup: Optional[float] = None
+    saved_tap_offset_backup_timestamp: Optional[float] = None
+
     # When probing multiple points (not rapid scan), how long to sample for at each probe point,
     # after a scan_sample_time_delay delay. The total dwell time at each probe point is
     # scan_sample_time + scan_sample_time_delay.
@@ -366,6 +379,16 @@ class ProbeEddyParams:
         )
         self.tap_retry_next_gcode = config.get("tap_retry_next_gcode", self.tap_retry_next_gcode)
 
+        self.saved_tap_z = config.getfloat("saved_tap_z", self.saved_tap_z)
+        self.saved_tap_offset = config.getfloat("saved_tap_offset", self.saved_tap_offset)
+        self.saved_tap_offset_version = config.getint("saved_tap_offset_version", self.saved_tap_offset_version, minval=1)
+        self.saved_tap_offset_timestamp = config.getfloat("saved_tap_offset_timestamp", self.saved_tap_offset_timestamp)
+        self.saved_tap_offset_name = config.get("saved_tap_offset_name", self.saved_tap_offset_name)
+
+        self.saved_tap_z_backup = config.getfloat("saved_tap_z_backup", self.saved_tap_z_backup)
+        self.saved_tap_offset_backup = config.getfloat("saved_tap_offset_backup", self.saved_tap_offset_backup)
+        self.saved_tap_offset_backup_timestamp = config.getfloat("saved_tap_offset_backup_timestamp", self.saved_tap_offset_backup_timestamp)
+
         if self.tap_trigger_safe_start_height == -1.0:  # sentinel
             self.tap_trigger_safe_start_height = self.home_trigger_height / 2.0
 
@@ -408,6 +431,11 @@ class ProbeEddyParams:
                 raise printer.config_error(
                     "ProbeEddy: tap_retry_metric='stddev' requires tap_samples > 1"
                 )
+
+        if self.saved_tap_offset_version != 1:
+            self._warning_msgs.append(
+                f"EDDYng Z offset: unknown saved_tap_offset_version {self.saved_tap_offset_version}; using version 1 parsing"
+            )
 
 
 @dataclass
@@ -568,6 +596,19 @@ class ProbeEddy:
         self._tap_offset = 0.0
         self._last_probe_result = 0.0
 
+        # Saved Z offset values loaded from config, and the currently active source.
+        # _active_z_offset_source is None (not active), "config" (loaded from config),
+        # or "calibrate" (set by PROBE_EDDY_NG_CALIBRATE_Z_OFFSET).
+        self._saved_tap_z = self.params.saved_tap_z
+        self._saved_tap_offset = self.params.saved_tap_offset
+        self._active_z_offset_source = None
+        self._loaded_computed_tap_z = None
+        if self._saved_tap_z is not None and self._saved_tap_offset is not None:
+            self._log_msg(
+                f"Loaded saved Z offset from config: tap_z={self._saved_tap_z:.3f}, "
+                f"tap_offset={self._saved_tap_offset:.3f}, name={self.params.saved_tap_offset_name!r}"
+            )
+
         # runtime configurable
         self._tap_adjust_z = self.params.tap_adjust_z
 
@@ -655,6 +696,26 @@ class ProbeEddy:
             "Z_OFFSET_APPLY_PROBE",
             self.cmd_Z_OFFSET_APPLY_PROBE,
             "Apply the current G-Code Z offset to tap_adjust_z",
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_CALIBRATE_Z_OFFSET",
+            self.cmd_CALIBRATE_Z_OFFSET,
+            self.cmd_CALIBRATE_Z_OFFSET_help,
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_LOAD_Z_OFFSET",
+            self.cmd_LOAD_Z_OFFSET,
+            self.cmd_LOAD_Z_OFFSET_help,
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_UNLOAD_Z_OFFSET",
+            self.cmd_UNLOAD_Z_OFFSET,
+            self.cmd_UNLOAD_Z_OFFSET_help,
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_CLEAR_SAVED_Z_OFFSET",
+            self.cmd_CLEAR_SAVED_Z_OFFSET,
+            self.cmd_CLEAR_SAVED_Z_OFFSET_help,
         )
 
         # some handy aliases while I'm debugging things to save my fingers
@@ -824,6 +885,105 @@ class ProbeEddy:
             fmap.save_calibration()
 
         self._log_msg("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+
+    def _save_z_offset_to_config(
+        self,
+        tap_z: float,
+        tap_offset: float,
+        name: str = "default",
+    ):
+        """Save the given Z offset values to the Klipper autosave configuration.
+
+        Before overwriting, the current autosave values (if any) are copied to
+        backup keys. The caller is responsible for ensuring tap_z and tap_offset
+        are valid. The actual disk write happens when the user issues SAVE_CONFIG.
+        """
+        configfile = self._printer.lookup_object("configfile")
+        section = self._full_name
+        now = time.time()
+
+        # Backup existing autosave values before overwriting them
+        asfc = configfile.autosave.fileconfig
+        old_tap_z = asfc.getfloat(section, "saved_tap_z", fallback=None)
+        old_tap_offset = asfc.getfloat(section, "saved_tap_offset", fallback=None)
+        old_timestamp = asfc.getfloat(section, "saved_tap_offset_timestamp", fallback=None)
+
+        if old_tap_z is not None and old_tap_offset is not None:
+            configfile.set(section, "saved_tap_z_backup", f"{old_tap_z:.6f}")
+            configfile.set(section, "saved_tap_offset_backup", f"{old_tap_offset:.6f}")
+            if old_timestamp is not None:
+                configfile.set(section, "saved_tap_offset_backup_timestamp", f"{old_timestamp:.3f}")
+            self._log_msg(
+                f"Saved Z offset backup: tap_z={old_tap_z:.3f}, tap_offset={old_tap_offset:.3f}"
+            )
+
+        # Write the new values
+        configfile.set(section, "saved_tap_z", f"{tap_z:.6f}")
+        configfile.set(section, "saved_tap_offset", f"{tap_offset:.6f}")
+        configfile.set(section, "saved_tap_offset_version", str(ProbeEddyParams.saved_tap_offset_version))
+        configfile.set(section, "saved_tap_offset_timestamp", f"{now:.3f}")
+        configfile.set(section, "saved_tap_offset_name", name)
+
+        self._log_msg(
+            f"Saved Z offset: tap_z={tap_z:.3f}, tap_offset={tap_offset:.3f}, name={name!r}. "
+            "Issue SAVE_CONFIG to write to your config file."
+        )
+
+    def _clear_saved_z_offset_from_config(self):
+        """Remove saved Z offset values from the Klipper autosave configuration.
+
+        Existing values are copied to backup keys before removal. The actual disk
+        write happens when the user issues SAVE_CONFIG.
+        """
+        configfile = self._printer.lookup_object("configfile")
+        section = self._full_name
+
+        asfc = configfile.autosave.fileconfig
+        old_tap_z = asfc.getfloat(section, "saved_tap_z", fallback=None)
+        old_tap_offset = asfc.getfloat(section, "saved_tap_offset", fallback=None)
+        old_timestamp = asfc.getfloat(section, "saved_tap_offset_timestamp", fallback=None)
+
+        if old_tap_z is not None and old_tap_offset is not None:
+            configfile.set(section, "saved_tap_z_backup", f"{old_tap_z:.6f}")
+            configfile.set(section, "saved_tap_offset_backup", f"{old_tap_offset:.6f}")
+            if old_timestamp is not None:
+                configfile.set(section, "saved_tap_offset_backup_timestamp", f"{old_timestamp:.3f}")
+            self._log_msg(
+                f"Cleared Z offset backup: tap_z={old_tap_z:.3f}, tap_offset={old_tap_offset:.3f}"
+            )
+
+        # Remove the saved keys from autosave if they exist
+        for key in (
+            "saved_tap_z",
+            "saved_tap_offset",
+            "saved_tap_offset_version",
+            "saved_tap_offset_timestamp",
+            "saved_tap_offset_name",
+        ):
+            if asfc.has_option(section, key):
+                configfile.autosave.fileconfig.remove_option(section, key)
+
+        self._log_msg("Cleared saved Z offset. Issue SAVE_CONFIG to update your config file.")
+
+    def _apply_z_offset_to_gcode_move(self, tap_z: float):
+        """Update the G-code coordinate system so that Z=0 corresponds to the bed.
+
+        This mirrors the HOME_Z=1 branch of cmd_TAP_next.
+        """
+        gcode_move = self._printer.lookup_object("gcode_move")
+        th = self._toolhead
+        th_pos = th.get_position()
+
+        # The true Z zero is the negative of the computed tap Z position.
+        true_z_zero = -tap_z
+        th_pos[2] = th_pos[2] + true_z_zero
+        self._set_toolhead_position(th_pos, [2])
+
+        # Update gcode coordinate system
+        gcode_delta = 0.0 - gcode_move.homing_position[2]
+        gcode_move.base_position[2] += gcode_delta
+        gcode_move.homing_position[2] = 0.0
+        self._last_tap_gcode_adjustment = 0.0
 
     def start_sampler(self, *args, **kwargs) -> ProbeEddySampler:
         if self._sampler:
@@ -1033,6 +1193,112 @@ class ProbeEddy:
             f"{self._name}: new tap_adjust_z: {offset:.3f}\n"
             "The SAVE_CONFIG command will update the printer config file\n"
             "with the above and restart the printer."
+        )
+
+    def cmd_CALIBRATE_Z_OFFSET(self, gcmd: GCodeCommand):
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before calibrating Z offset")
+
+        name = gcmd.get("NAME", "default")
+
+        # Remember the last tap Z before this calibration so we can detect if the
+        # tap sequence aborted without producing new values.
+        last_tap_z_before = self._last_tap_z
+
+        self._log_msg(f"Starting automatic Z offset calibration (name={name!r})")
+
+        try:
+            self.cmd_TAP_next(gcmd)
+        except Exception:
+            self._log_error("Z offset calibration failed: tap sequence did not complete")
+            raise
+
+        if self._last_tap_z == last_tap_z_before:
+            raise self._printer.command_error(
+                "Z offset calibration failed: tap sequence did not update the tap Z value"
+            )
+
+        self._save_z_offset_to_config(self._last_tap_z, self._tap_offset, name)
+        self._active_z_offset_source = "calibrate"
+        self._loaded_computed_tap_z = self._last_tap_z + self._tap_adjust_z
+
+        gcmd.respond_info(
+            f"Z offset calibrated and saved: tap_z={self._last_tap_z:.3f}, "
+            f"tap_offset={self._tap_offset:.3f}, name={name!r}\n"
+            "Issue SAVE_CONFIG to write the values to your config file."
+        )
+
+    def cmd_LOAD_Z_OFFSET(self, gcmd: GCodeCommand):
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before loading Z offset")
+
+        if self._saved_tap_z is None or self._saved_tap_offset is None:
+            raise self._printer.command_error(
+                "No saved Z offset available. Run PROBE_EDDY_NG_CALIBRATE_Z_OFFSET first."
+            )
+
+        # If a saved offset is already active, unload it first to avoid stacking shifts.
+        if self._active_z_offset_source is not None:
+            self._log_msg("Unloading previously active Z offset before loading new values")
+            self.cmd_UNLOAD_Z_OFFSET(gcmd)
+
+        name = gcmd.get("NAME", "default")
+        if name != self.params.saved_tap_offset_name:
+            raise self._printer.command_error(
+                f"Saved Z offset name mismatch: requested {name!r}, "
+                f"but config has {self.params.saved_tap_offset_name!r}"
+            )
+
+        computed_tap_z = self._saved_tap_z + self._tap_adjust_z
+
+        self._apply_z_offset_to_gcode_move(computed_tap_z)
+        self._tap_offset = self._saved_tap_offset
+        self._last_tap_z = self._saved_tap_z
+        self._loaded_computed_tap_z = computed_tap_z
+        self._active_z_offset_source = "config"
+
+        self._log_msg(
+            f"Loaded saved Z offset: tap_z={self._saved_tap_z:.3f}, "
+            f"tap_offset={self._saved_tap_offset:.3f}, name={name!r}, "
+            f"computed_tap_z={computed_tap_z:.3f}"
+        )
+        gcmd.respond_info(
+            f"Z offset loaded from config: tap_z={self._saved_tap_z:.3f}, "
+            f"tap_offset={self._saved_tap_offset:.3f}, name={name!r}"
+        )
+
+    def cmd_UNLOAD_Z_OFFSET(self, gcmd: GCodeCommand):
+        if self._active_z_offset_source is None:
+            gcmd.respond_info("No saved Z offset is currently loaded")
+            return
+
+        if self._loaded_computed_tap_z is not None:
+            # Reverse the coordinate shift applied by _apply_z_offset_to_gcode_move.
+            gcode_move = self._printer.lookup_object("gcode_move")
+            th = self._toolhead
+            th_pos = th.get_position()
+            th_pos[2] = th_pos[2] + self._loaded_computed_tap_z
+            self._set_toolhead_position(th_pos, [2])
+
+            gcode_delta = self._loaded_computed_tap_z - gcode_move.homing_position[2]
+            gcode_move.base_position[2] += gcode_delta
+            gcode_move.homing_position[2] = self._loaded_computed_tap_z
+            self._last_tap_gcode_adjustment = self._loaded_computed_tap_z
+
+        self._tap_offset = 0.0
+        self._last_tap_z = 0.0
+        source = self._active_z_offset_source
+        self._active_z_offset_source = None
+        self._loaded_computed_tap_z = None
+
+        self._log_msg(f"Unloaded saved Z offset (source was {source})")
+        gcmd.respond_info("Saved Z offset unloaded")
+
+    def cmd_CLEAR_SAVED_Z_OFFSET(self, gcmd: GCodeCommand):
+        self._clear_saved_z_offset_from_config()
+        gcmd.respond_info(
+            "Saved Z offset cleared from autosave. "
+            "Issue SAVE_CONFIG to update your config file."
         )
 
     def probe_static_height(self, duration: float = 0.100) -> ProbeEddyProbeResult:
@@ -1269,6 +1535,25 @@ class ProbeEddy:
     cmd_CALIBRATE_help = (
         "Calibrate the eddy current sensor. Specify DRIVE_CURRENT to calibrate for a different drive current "
         + "than the default. Specify START_Z to set a different calibration start point."
+    )
+
+    cmd_CALIBRATE_Z_OFFSET_help = (
+        "Automatically calibrate the Z offset by performing a tap and saving the resulting tap_z and tap_offset. "
+        "Specify NAME to tag the saved values. Other parameters mirror PROBE_EDDY_NG_TAP."
+    )
+
+    cmd_LOAD_Z_OFFSET_help = (
+        "Load a previously saved Z offset (tap_z and tap_offset) from the config file and apply it. "
+        "Specify NAME to verify the saved profile name."
+    )
+
+    cmd_UNLOAD_Z_OFFSET_help = (
+        "Unload the currently active saved Z offset, resetting the runtime tap offset and G-code coordinate system."
+    )
+
+    cmd_CLEAR_SAVED_Z_OFFSET_help = (
+        "Clear saved Z offset values from the config file. The previous values are backed up before removal. "
+        "Issue SAVE_CONFIG to make the change permanent."
     )
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
@@ -1510,6 +1795,10 @@ class ProbeEddy:
                 "tap_adjust_z": float(self._tap_adjust_z),
                 "last_probe_result": float(self._last_probe_result),
                 "last_tap_z": float(self._last_tap_z),
+                "saved_tap_z": float(self._saved_tap_z) if self._saved_tap_z is not None else None,
+                "saved_tap_offset": float(self._saved_tap_offset) if self._saved_tap_offset is not None else None,
+                "active_z_offset_source": self._active_z_offset_source,
+                "saved_tap_offset_name": self.params.saved_tap_offset_name,
             }
         )
         return status
@@ -1948,11 +2237,59 @@ class ProbeEddy:
         except Exception as e:
             self._log_error(f"Tap retry: failed to execute next gcode '{next_gcode}': {e}")
 
+    def _cmd_TAP_use_saved(self, gcmd: GCodeCommand):
+        """Apply a previously saved Z offset without performing a physical tap."""
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before using saved tap values")
+
+        if self._saved_tap_z is None or self._saved_tap_offset is None:
+            raise self._printer.command_error(
+                "No saved Z offset available. Run PROBE_EDDY_NG_CALIBRATE_Z_OFFSET first, "
+                "or configure saved_tap_z and saved_tap_offset in your config."
+            )
+
+        # If a saved offset is already active, unload it first to avoid stacking shifts.
+        if self._active_z_offset_source is not None:
+            self._log_msg("Unloading previously active Z offset before using saved values")
+            self.cmd_UNLOAD_Z_OFFSET(gcmd)
+
+        do_retract = gcmd.get_int("RETRACT", 1) == 1
+        lift_speed: float = gcmd.get_float("RETRACT_SPEED", self.params.lift_speed, above=0.0)
+        tap_adjust_z = gcmd.get_float("ADJUST_Z", self._tap_adjust_z)
+        computed_tap_z = self._saved_tap_z + tap_adjust_z
+
+        self._log_msg(
+            f"Using saved Z offset: tap_z={self._saved_tap_z:.3f}, "
+            f"tap_offset={self._saved_tap_offset:.3f}, computed_tap_z={computed_tap_z:.3f}"
+        )
+
+        self._apply_z_offset_to_gcode_move(computed_tap_z)
+        self._tap_offset = self._saved_tap_offset
+        self._last_tap_z = self._saved_tap_z
+        self._loaded_computed_tap_z = computed_tap_z
+        self._active_z_offset_source = "config"
+
+        th = self._toolhead
+        if do_retract:
+            th.manual_move([None, None, self._home_start_height], lift_speed)
+            th.wait_moves()
+            th.flush_step_generation()
+
+        self._log_msg(
+            f"Probe computed tap at {computed_tap_z:.3f} (tap at z={self._saved_tap_z:.3f}) "
+            f"sensor offset {self._tap_offset:.3f} at z={self.params.home_trigger_height:.3f} [from saved values]"
+        )
+        self._log_debug("EDDYng Tap end\n")
+
     def cmd_TAP_next(self, gcmd: Optional[GCodeCommand] = None):
         self._log_debug("\nEDDYng Tap begin")
 
         if gcmd is None:
             gcmd = self._dummy_gcode_cmd
+
+        use_saved: bool = gcmd.get_int("USE_SAVED", 0) == 1
+        if use_saved:
+            return self._cmd_TAP_use_saved(gcmd)
 
         orig_drive_current: int = self._sensor.get_drive_current()
         tap_drive_current: int = gcmd.get_int(
