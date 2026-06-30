@@ -1202,7 +1202,7 @@ class ProbeEddy:
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd: GCodeCommand):
         gcode_move = self._printer.lookup_object("gcode_move")
         offset = gcode_move.get_status()["homing_origin"].z
-        offset += self.params.tap_adjust_z
+        offset += self._tap_adjust_z
         offset -= self._last_tap_gcode_adjustment
         configfile = self._printer.lookup_object("configfile")
         configfile.set(self._full_name, "tap_adjust_z", f"{offset:.3f}")
@@ -1236,6 +1236,9 @@ class ProbeEddy:
             )
 
         self._save_z_offset_to_config(self._last_tap_z, self._tap_offset, name)
+        self._saved_tap_z = self._last_tap_z
+        self._saved_tap_offset = self._tap_offset
+        self.params.saved_tap_offset_name = name
         self._active_z_offset_source = "calibrate"
         self._loaded_computed_tap_z = self._last_tap_z + self._tap_adjust_z
 
@@ -1304,6 +1307,7 @@ class ProbeEddy:
 
         self._tap_offset = 0.0
         self._last_tap_z = 0.0
+        self._last_tap_gcode_adjustment = 0.0
         source = self._active_z_offset_source
         self._active_z_offset_source = None
         self._loaded_computed_tap_z = None
@@ -1313,6 +1317,9 @@ class ProbeEddy:
 
     def cmd_CLEAR_SAVED_Z_OFFSET(self, gcmd: GCodeCommand):
         self._clear_saved_z_offset_from_config()
+        self._saved_tap_z = None
+        self._saved_tap_offset = None
+        self.params.saved_tap_offset_name = "default"
         gcmd.respond_info(
             "Saved Z offset cleared from autosave. "
             "Issue SAVE_CONFIG to update your config file."
@@ -2067,7 +2074,8 @@ class ProbeEddy:
 
                 # If just sensor errors, let the caller handle it
                 self._log_error(f"Tap failed with Z at {finish_z:.3f}: {err}")
-                if "Sensor error" or "Probe completed movement" or "Probe triggered prior" in str(err):
+                err_str = str(err)
+                if any(s in err_str for s in ("Sensor error", "Probe completed movement", "Probe triggered prior")):
                     return ProbeEddy.TapResult(
                         error=err,
                         toolhead_z=finish_z,
@@ -2552,6 +2560,11 @@ class ProbeEddy:
 
         result = self.probe_static_height()
         self._tap_offset = float(self.params.home_trigger_height - result.value)
+
+        # Track this as a live tap so UNLOAD_Z_OFFSET can reverse it consistently
+        # with saved offsets.
+        self._active_z_offset_source = "live"
+        self._loaded_computed_tap_z = computed_tap_z
 
         self._log_msg(
             f"Probe computed tap at {computed_tap_z:.3f} (tap at z={tap_z:.3f}, "
