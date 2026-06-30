@@ -448,6 +448,16 @@ class ProbeEddyParams:
                 raise printer.config_error(
                     "ProbeEddy: tap_retry_metric='stddev' requires tap_samples > 1"
                 )
+            if self.tap_retry_threshold <= 0.0:
+                raise printer.config_error(
+                    "ProbeEddy: tap_retry_threshold must be > 0.0 when tap_retry_enable is True"
+                )
+
+        if self.tap_max_samples > 10:
+            self._warning_msgs.append(
+                f"EDDYng: tap_max_samples={self.tap_max_samples} is very large; "
+                "tap z computation may be slow. Consider reducing it to <= 10."
+            )
 
         if self.saved_tap_offset_version != 1:
             self._warning_msgs.append(
@@ -2588,7 +2598,21 @@ class ProbeEddy:
         tap_z = math.inf
         std_min = math.inf
         overshoot = math.inf
-        for cluster in combinations(taps, samples):
+
+        # Full combinatorial search is exponential; fall back to a sorted sliding
+        # window when the number of combinations would be excessive.
+        combo_count = math.comb(len(taps), samples)
+        use_sliding_window = combo_count > 5000
+        if use_sliding_window:
+            self._log_debug(
+                f"_compute_tap_z: {combo_count} combinations too large, using sorted sliding window"
+            )
+            sorted_taps = sorted(taps, key=lambda t: t.probe_z)
+            clusters = (sorted_taps[i:i + samples] for i in range(len(sorted_taps) - samples + 1))
+        else:
+            clusters = combinations(taps, samples)
+
+        for cluster in clusters:
             tap_zs = np.array([t.probe_z for t in cluster])
             overshoots = np.array([t.overshoot for t in cluster])
             std = np.std(tap_zs)

@@ -23,7 +23,7 @@ except ImportError:
 
 MIN_MSG_TIME = 0.100
 
-BATCH_UPDATES = 0.100
+DEFAULT_BATCH_UPDATES = 0.100
 
 LDC1612_ADDR = 0x2A
 
@@ -133,6 +133,9 @@ class LDC1612_ng:
         self._deglitch: str = config.get("ldc_deglitch", "default").lower()
         self._data_rate: int = config.getint("samples_per_second", 250, minval=50)
         self._ldc_settle_time = min(self._ldc_settle_time, 1.0 / self._data_rate)
+        self._batch_update_interval: float = config.getfloat(
+            "batch_update_interval", DEFAULT_BATCH_UPDATES, above=0.0
+        )
 
         # Setup mcu sensor_ldc1612 bulk query code
         self._i2c = bus.MCU_I2C_from_config(config, default_addr=LDC1612_ADDR, default_speed=400000)
@@ -172,7 +175,7 @@ class LDC1612_ng:
         self._chip_initialized = False
 
         # Bulk sample message reading
-        chip_smooth = self._data_rate * BATCH_UPDATES * 2
+        chip_smooth = self._data_rate * self._batch_update_interval * 2
         self._ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, ">I")
         # Process messages in batches
         self._batch_bulk = bulk_sensor.BatchBulkHelper(
@@ -180,7 +183,7 @@ class LDC1612_ng:
             self._process_batch,
             self._start_measurements,
             self._finish_measurements,
-            BATCH_UPDATES,
+            self._batch_update_interval,
         )
         hdr = ("time", "frequency", "z")
         self._batch_bulk.add_mux_endpoint("ldc1612_ng/dump_ldc1612", "sensor", self._name, {"header": hdr})
