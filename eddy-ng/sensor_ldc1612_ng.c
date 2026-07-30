@@ -334,11 +334,9 @@ config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, uint8_t product, int32_t intb_
 
         // The Cartographer hardware uses a timer in the STM32F0
         // to generate a 24MHz reference clock for the ldc1612.
-        // Uses a new _with_max setup here because otherwise we
-        // can't actually get to 24MHz from 48MHz. This could be
-        // configured from the python side but that requires
-        // adding a bunch of new commands.
-        gpio_pwm_setup_with_max(GPIO('B', 4), 1, 1, 2);
+        // On Klipper >= v0.13.0 the minimum pwm cycle ticks is 2,
+        // so a cycle_time of 2 ticks at 48MHz yields 24MHz.
+        gpio_pwm_setup(GPIO('B', 4), 2, 1);
 
         // There's a LED -- do something with it in the future,
         // showing homing progress

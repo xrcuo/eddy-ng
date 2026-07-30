@@ -44,7 +44,7 @@ try:
     from klippy.extras.homing import HomingMove
 
     IS_KALICO = True
-    HAS_PROBE_RESULT_TYPE = False
+    HAS_PROBE_RESULT_TYPE = hasattr(manual_probe, "ProbeResult")
 except ImportError:
     import mcu
     import pins
