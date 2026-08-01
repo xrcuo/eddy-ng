@@ -268,6 +268,18 @@ class ProbeEddyParams:
     # whether to print lots of verbose debug info to the log
     debug: bool = True
 
+    # Temperature compensation configuration
+    # Name of a Klipper temperature sensor (e.g. "extruder", "heater_bed",
+    # or a [temperature_sensor xxx] section name) used to track probe temperature.
+    temp_sensor: str = "extruder"
+    # Enable dynamic temperature compensation for tap_offset during probing.
+    temp_compensate: bool = False
+    # Manual temperature coefficient in mm/°C. Positive means the probe reading
+    # increases (sensor appears closer to the bed) as temperature rises.
+    # If left at 0.0 while temp_compensate is enabled, the coefficient is learned
+    # automatically from taps performed at different temperatures.
+    temp_coeff: float = 0.0
+
     tap_trigger_safe_start_height: float = 1.5
 
     _warning_msgs: List[str] = field(default_factory=list)
@@ -345,6 +357,10 @@ class ProbeEddyParams:
         self.debug = config.getboolean("debug", self.debug)
 
         self.max_errors = config.getint("max_errors", self.max_errors)
+
+        self.temp_sensor = config.get("temp_sensor", self.temp_sensor)
+        self.temp_compensate = config.getboolean("temp_compensate", self.temp_compensate)
+        self.temp_coeff = config.getfloat("temp_coeff", self.temp_coeff)
 
         self.x_offset = config.getfloat("x_offset", self.x_offset)
         self.y_offset = config.getfloat("y_offset", self.y_offset)
@@ -530,7 +546,14 @@ class ProbeEddy:
         # when doing a scan, what's the offset between probe readings at the bed
         # scan height and the accurate bed height, based on the last tap.
         self._tap_offset = 0.0
+        # temperature at which _tap_offset was measured
+        self._tap_offset_temp = None
         self._last_probe_result = 0.0
+
+        # Temperature compensation state
+        self._temp_sensor = None
+        self._temp_coeff = self.params.temp_coeff
+        self._temp_cal_points: List[Tuple[float, float]] = []
 
         # runtime configurable
         self._tap_adjust_z = self.params.tap_adjust_z
@@ -614,6 +637,11 @@ class ProbeEddy:
             self.cmd_TEST_DRIVE_CURRENT,
             "Test a drive current.",
         )
+        gcode.register_command(
+            "PROBE_EDDY_NG_SET_TEMP_COEFF",
+            self.cmd_SET_TEMP_COEFF,
+            "Set or clear the temperature compensation coefficient",
+        )
         gcode.register_command("Z_OFFSET_APPLY_PROBE", None)
         gcode.register_command(
             "Z_OFFSET_APPLY_PROBE",
@@ -657,8 +685,86 @@ class ProbeEddy:
     def _handle_connect(self):
         self._toolhead = self._printer.lookup_object("toolhead")
         self._trapq = self._toolhead.get_trapq()
+        if self.params.temp_compensate:
+            self._lookup_temp_sensor()
         for msg in self.params._warning_msgs:
             self._log_warning(msg)
+
+    #
+    # Temperature compensation helpers
+    #
+    def _lookup_temp_sensor(self):
+        try:
+            self._temp_sensor = self._printer.lookup_object(self.params.temp_sensor)
+            self._log_msg(
+                f"Temperature compensation enabled using sensor '{self.params.temp_sensor}'"
+            )
+        except Exception:
+            self._temp_sensor = None
+            self._log_warning(
+                f"Temperature sensor '{self.params.temp_sensor}' not found; "
+                "temperature compensation disabled"
+            )
+            self.params.temp_compensate = False
+
+    def _get_sensor_temp(self) -> Optional[float]:
+        if self._temp_sensor is None:
+            return None
+        try:
+            status = self._temp_sensor.get_status(self._reactor.monotonic())
+            return float(status.get("temperature"))
+        except Exception:
+            return None
+
+    def _get_temp_compensated_offset(
+        self, offset: float, offset_temp: Optional[float], current_temp: Optional[float] = None
+    ) -> float:
+        if not self.params.temp_compensate or offset_temp is None:
+            return offset
+        if current_temp is None:
+            current_temp = self._get_sensor_temp()
+        if current_temp is None:
+            return offset
+        # Linear model: as temperature rises the sensor reading drifts by
+        # temp_coeff mm/°C. A positive coeff means the probe appears closer
+        # to the bed, so the effective tap offset must be reduced.
+        return offset - (current_temp - offset_temp) * self._temp_coeff
+
+    @property
+    def _effective_tap_offset(self) -> float:
+        return self._get_temp_compensated_offset(self._tap_offset, self._tap_offset_temp)
+
+    def _update_temp_calibration(self, offset: float, temp: Optional[float]):
+        if not self.params.temp_compensate or temp is None:
+            return
+        # keep a sliding window of calibration points
+        self._temp_cal_points.append((temp, offset))
+        max_points = 10
+        if len(self._temp_cal_points) > max_points:
+            self._temp_cal_points = self._temp_cal_points[-max_points:]
+        # manual coefficient always wins
+        if self.params.temp_coeff != 0.0:
+            self._temp_coeff = self.params.temp_coeff
+            return
+        self._compute_temp_coefficient()
+
+    def _compute_temp_coefficient(self):
+        if len(self._temp_cal_points) < 2:
+            self._temp_coeff = 0.0
+            return
+        points = sorted(self._temp_cal_points, key=lambda p: p[0])
+        t_min, o_min = points[0]
+        t_max, o_max = points[-1]
+        if abs(t_max - t_min) < 5.0:
+            # not enough temperature spread to trust the slope
+            self._temp_coeff = 0.0
+            return
+        # coeff in mm/°C of sensor reading drift; offset change is opposite
+        self._temp_coeff = -(o_max - o_min) / (t_max - t_min)
+        self._log_msg(
+            f"Auto-learned temperature coefficient: {self._temp_coeff:.6f} mm/°C "
+            f"(from {t_min:.1f}°C to {t_max:.1f}°C)"
+        )
 
     def _get_trapq_position(self, print_time: float) -> Tuple[Tuple[float, float, float], float]:
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -968,7 +1074,11 @@ class ProbeEddy:
         if adjust is not None:
             tap_offset += adjust
         self._tap_offset = tap_offset
-        gcmd.respond_info(f"Set tap offset: {tap_offset:.3f}")
+        self._tap_offset_temp = self._get_sensor_temp()
+        gcmd.respond_info(
+            f"Set tap offset: {tap_offset:.3f} "
+            f"(temp={self._tap_offset_temp if self._tap_offset_temp is not None else 'n/a'})"
+        )
 
     def cmd_SET_TAP_ADJUST_Z(self, gcmd: GCodeCommand):
         value = gcmd.get_float("VALUE", None)
@@ -985,6 +1095,26 @@ class ProbeEddy:
             configfile.set(self._full_name, "tap_adjust_z", str(float(self._tap_adjust_z)))
 
         gcmd.respond_info(f"Set tap_adjust_z: {tap_adjust_z:.3f} (SAVE_CONFIG to make it permanent)")
+
+    def cmd_SET_TEMP_COEFF(self, gcmd: GCodeCommand):
+        value = gcmd.get_float("VALUE", None)
+        clear = gcmd.get_int("CLEAR", 0) == 1
+        if clear:
+            self._temp_coeff = 0.0
+            self._temp_cal_points = []
+            self.params.temp_coeff = 0.0
+            gcmd.respond_info("Cleared temperature calibration and coefficient")
+            return
+        if value is not None:
+            self._temp_coeff = float(value)
+            self.params.temp_coeff = float(value)
+            gcmd.respond_info(f"Set temperature coefficient: {self._temp_coeff:.6f} mm/°C")
+            return
+        gcmd.respond_info(
+            f"Temperature coefficient: {self._temp_coeff:.6f} mm/°C "
+            f"(config temp_coeff={self.params.temp_coeff:.6f}, "
+            f"calibration points={len(self._temp_cal_points)})"
+        )
 
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd: GCodeCommand):
         gcode_move = self._printer.lookup_object("gcode_move")
@@ -1471,9 +1601,15 @@ class ProbeEddy:
                 "name": self._full_name,
                 "home_trigger_height": float(self.params.home_trigger_height),
                 "tap_offset": float(self._tap_offset),
+                "effective_tap_offset": float(self._effective_tap_offset),
+                "tap_offset_temp": float(self._tap_offset_temp) if self._tap_offset_temp is not None else None,
                 "tap_adjust_z": float(self._tap_adjust_z),
                 "last_probe_result": float(self._last_probe_result),
                 "last_tap_z": float(self._last_tap_z),
+                "temp_compensate": bool(self.params.temp_compensate),
+                "temp_sensor": str(self.params.temp_sensor),
+                "temp_coeff": float(self._temp_coeff),
+                "current_temp": self._get_sensor_temp(),
             }
         )
         return status
@@ -1516,7 +1652,7 @@ class ProbeEddy:
             raise self._printer.command_error("Probe captured no samples!")
 
         height = r.value
-        height += self._tap_offset
+        height += self._effective_tap_offset
 
         # At what Z position would the toolhead be at for the probe to read
         # _home_trigger_height? In other words, if the probe tells us
@@ -1994,11 +2130,18 @@ class ProbeEddy:
 
         result = self.probe_static_height()
         self._tap_offset = float(self.params.home_trigger_height - result.value)
+        self._tap_offset_temp = self._get_sensor_temp()
+        self._update_temp_calibration(self._tap_offset, self._tap_offset_temp)
+
+        temp_str = ""
+        if self.params.temp_compensate and self._tap_offset_temp is not None:
+            temp_str = f"temp={self._tap_offset_temp:.1f}°C coeff={self._temp_coeff:.6f} mm/°C, "
 
         self._log_msg(
             f"Probe computed tap at {computed_tap_z:.3f} (tap at z={tap_z:.3f}, "
             f"stddev {tap_stddev:.3f}) with {samples} samples, {homed_to_str}"
-            f"sensor offset {self._tap_offset:.3f} at z={self.params.home_trigger_height:.3f}"
+            f"sensor offset {self._tap_offset:.3f} at z={self.params.home_trigger_height:.3f}, "
+            f"{temp_str}effective offset {self._effective_tap_offset:.3f}"
         )
 
         if do_retract:
@@ -2271,11 +2414,6 @@ class ProbeEddyScanningProbe:
         # also expects to return values based on this height
         self._scan_z = eddy.params.home_trigger_height
 
-        # sensor thinks is _home_trigger_height vs. what it actually is.
-        # For example, if we do a tap, adjust, and then we move the toolhead up
-        # to 2.0 but the sensor says 1.950, then this would be +0.050.
-        self._tap_offset = eddy._tap_offset
-
         # how much to dwell at each sample position in addition to sample_time
         self._sample_time_delay = self.eddy.params.scan_sample_time_delay
         self._sample_time: float = gcmd.get_float("SAMPLE_TIME", self.eddy.params.scan_sample_time, above=0.0)
@@ -2359,8 +2497,9 @@ class ProbeEddyScanningProbe:
             h_orig = height
             tz_orig = th_pos[2]
 
-            # adjust the sensor height value based on the fine-tuned tap offset amount
-            height += self._tap_offset
+            # adjust the sensor height value based on the fine-tuned tap offset amount,
+            # applying temperature compensation if enabled
+            height += self._eddy._effective_tap_offset
 
             # the delta between where the toolhead thinks it should be (since it
             # should be homed), and the actual physical offset (height)
@@ -3360,7 +3499,7 @@ class BedMeshScanHelper:
             heights = sampler.find_heights_at_times([(t - sample_time/2., t + sample_time/2.) for t in path_times])
             # Note plus tap_offset here, vs -tap_offset when probing. These are actual
             # heights, the other is "offset from real"
-            heights = [h + self._eddy._tap_offset for h in heights]
+            heights = [h + self._eddy._effective_tap_offset for h in heights]
 
             with open("/tmp/mesh.csv", "w") as mfile:
                 mfile.write("time,x,y,z\n")
