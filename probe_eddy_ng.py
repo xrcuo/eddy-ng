@@ -2499,7 +2499,7 @@ class ProbeEddyScanningProbe:
 
             # adjust the sensor height value based on the fine-tuned tap offset amount,
             # applying temperature compensation if enabled
-            height += self._eddy._effective_tap_offset
+            height += self.eddy._effective_tap_offset
 
             # the delta between where the toolhead thinks it should be (since it
             # should be homed), and the actual physical offset (height)
